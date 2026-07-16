@@ -1,0 +1,145 @@
+---
+# ──────────────────────────────────────────────────────────────────────
+# CRMedia Bot — Ansible Deployment Playbook
+# Deploys the web app to a remote server via Ansible.
+#
+# Usage:
+#   ansible-playbook -i inventory.ini ansible/deploy.yml
+#
+# Variables (set in inventory or extra-vars):
+#   - deploy_path: Remote path to deploy to
+#   - domain: Server domain name
+#   - convex_deploy_key: Convex deploy key
+#   - vite_convex_url: Convex deployment URL
+# ──────────────────────────────────────────────────────────────────────
+
+- name: Deploy CRMedia Bot
+  hosts: crmedia_servers
+  become: true
+  vars:
+    deploy_path: /var/www/crmedia-bot
+    domain: "{{ inventory_hostname }}"
+    node_version: "20"
+    app_port: 5173
+    nginx_port: 80
+
+  tasks:
+    # ── System Setup ──
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      tags: setup
+
+    - name: Install required packages
+      apt:
+        name:
+          - curl
+          - git
+          - nginx
+          - certbot
+          - python3-certbot-nginx
+          - build-essential
+        state: present
+      tags: setup
+
+    - name: Install Node.js {{ node_version }}
+      shell: |
+        curl -fsSL https://deb.nodesource.com/setup_{{ node_version }}.x | bash -
+        apt-get install -y nodejs
+      args:
+        creates: /usr/bin/node
+      tags: setup
+
+    # ── User Setup ──
+    - name: Create app user
+      user:
+        name: crmedia
+        shell: /bin/bash
+        home: /home/crmedia
+        system: yes
+      tags: setup
+
+    # ── Deploy Application ──
+    - name: Create deploy directory
+      file:
+        path: "{{ deploy_path }}"
+        state: directory
+        owner: crmedia
+        group: crmedia
+        mode: '0755'
+      tags: deploy
+
+    - name: Clone or update repository
+      git:
+        repo: "https://github.com/your-org/crmedia-bot.git"
+        dest: "{{ deploy_path }}"
+        version: main
+        force: yes
+      become_user: crmedia
+      tags: deploy
+
+    - name: Install npm dependencies
+      npm:
+        path: "{{ deploy_path }}"
+        ci: yes
+      become_user: crmedia
+      tags: deploy
+
+    - name: Deploy Convex backend
+      shell: npx convex dev --once
+      args:
+        chdir: "{{ deploy_path }}"
+      become_user: crmedia
+      environment:
+        CONVEX_DEPLOY_KEY: "{{ convex_deploy_key }}"
+        CONVEX_DEPLOYMENT: "{{ convex_deployment }}"
+      tags: deploy
+
+    - name: Run TypeScript check
+      shell: npx tsc -b --noEmit
+      args:
+        chdir: "{{ deploy_path }}"
+      become_user: crmedia
+      tags: deploy
+
+    - name: Build frontend
+      shell: npm run build
+      args:
+        chdir: "{{ deploy_path }}"
+      become_user: crmedia
+      environment:
+        VITE_CONVEX_URL: "{{ vite_convex_url }}"
+      tags: deploy
+
+    # ── Nginx Configuration ──
+    - name: Configure Nginx
+      template:
+        src: nginx.conf.j2
+        dest: /etc/nginx/sites-available/crmedia-bot
+      notify: Reload Nginx
+      tags: nginx
+
+    - name: Enable Nginx site
+      file:
+        src: /etc/nginx/sites-available/crmedia-bot
+        dest: /etc/nginx/sites-enabled/crmedia-bot
+        state: link
+      notify: Reload Nginx
+      tags: nginx
+
+    # ── SSL/TLS ──
+    - name: Obtain SSL certificate
+      shell: >
+        certbot --nginx -d {{ domain }}
+        --non-interactive
+        --agree-tos
+        --email admin@{{ domain }}
+      when: enable_ssl | default(true)
+      tags: ssl
+
+  handlers:
+    - name: Reload Nginx
+      service:
+        name: nginx
+        state: reloaded
